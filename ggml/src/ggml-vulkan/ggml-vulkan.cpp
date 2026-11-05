@@ -12443,6 +12443,16 @@ static const ggml_tensor * ggml_vk_find_gdn_state_cpy(ggml_backend_vk_context * 
             (c->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             GDN_REJECT("destination not a contiguous device F32 cache view of the expected shape");
         }
+        // the destination must not overlap the GDN's own output or any of its inputs: fused, the snapshot writes
+        // happen in the same dispatch as the GDN's other writes and reads (review R19)
+        if (ggml_vk_tensors_overlap(gdn, c, false)) {
+            GDN_REJECT("the destination overlaps the GDN output");
+        }
+        for (int q = 0; q < GGML_MAX_SRC; ++q) {
+            if (q != 5 && gdn->src[q] && gdn->src[q]->buffer && ggml_vk_tensors_overlap(gdn->src[q], c, false)) {
+                GDN_REJECT("the destination overlaps a GDN input");
+            }
+        }
         // the input state must not alias the destination (a direct-from-cache state getter would race in place)
         if (gdn->src[5] && gdn->src[5]->buffer && ggml_vk_tensors_overlap(gdn->src[5], c, false)) {
             GDN_REJECT("input state aliases the destination");

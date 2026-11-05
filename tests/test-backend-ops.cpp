@@ -5191,7 +5191,8 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     const int64_t K; // snapshot slot count (>1)
     // 0: fusable; the others must not fuse (the state region the fused GDN no longer writes is read elsewhere):
     // 1: a second reader of the state view; 2: a view of the attention view reaching into the state region (a nested
-    // alias: its view_src is the GDN output, its src[0] the attention view); 3: the GDN output is a graph output
+    // alias: its view_src is the GDN output, its src[0] the attention view); 3: the GDN output is a graph output;
+    // 4: the CPY's destination is a view into the GDN output's own attention region
     const int variant;
 
     ggml_tensor * cpy_node = nullptr;
@@ -5249,9 +5250,11 @@ struct test_gated_delta_net_cache_fusion : public test_case {
                 ggml_row_size(gdn_out->type, D * n_seqs),
                 ggml_row_size(gdn_out->type, attn_score_elems));
 
-        // recurrent cache view [D, n_seqs, n_written]
-        ggml_tensor * cache = ggml_new_tensor_3d(ctx, type, D, n_seqs, n_written);
-        ggml_set_name(cache, "cache");
+        // recurrent cache view [D, n_seqs, n_written] (variant 4: a view of the GDN output itself)
+        ggml_tensor * cache = variant == 4 ? gdn_out : ggml_new_tensor_3d(ctx, type, D, n_seqs, n_written);
+        if (variant != 4) {
+            ggml_set_name(cache, "cache");
+        }
         ggml_tensor * dst = ggml_view_3d(ctx, cache,
                 D, n_seqs, n_written,
                 ggml_row_size(cache->type, D),
@@ -12749,6 +12752,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32, 2, 1, 2, variant));
         test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32, 4, 2, 4, variant));
     }
+    // destination inside the GDN output's attention region (needs n_tokens * S_v * H >= D * n_written): review R19
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32, 64, 1, 2, 4));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
