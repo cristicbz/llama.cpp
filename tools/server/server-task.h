@@ -99,6 +99,7 @@ struct task_params {
 
     bool timings_per_token   = false;
     bool post_sampling_probs = false;
+    int32_t n_probs_tokens   = 0; // probabilities only for the first N generated tokens (0 = every token)
 
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
