@@ -12415,6 +12415,9 @@ static int32_t ggml_vk_tensor_use_count(const ggml_cgraph * cgraph, const ggml_t
 // returns that CPY if the GDN shader can write the snapshots there directly.
 static const ggml_tensor * ggml_vk_find_gdn_state_cpy(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i, int last_node) {
     static const bool disabled = getenv("GGML_VK_DISABLE_GDN_CPY_FUSION") != nullptr;
+    static const bool log_reject = getenv("GGML_VK_LOG_GDN_CPY_FUSION") != nullptr;
+#define GDN_REJECT(why) do { if (log_reject) { fprintf(stderr, "ggml_vulkan: GDN state-CPY fusion rejected: %s\n", why); } \
+                             return nullptr; } while (0)
     const ggml_tensor * gdn = cgraph->nodes[i];
     if (disabled || ctx->device->disable_fusion || gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32) {
         return nullptr;
@@ -12438,11 +12441,11 @@ static const ggml_tensor * ggml_vk_find_gdn_state_cpy(ggml_backend_vk_context * 
         if (c->type != GGML_TYPE_F32 || !c->buffer || ggml_backend_buffer_is_host(c->buffer) || c->nb[0] != sizeof(float) ||
             c->ne[0] != D || c->ne[1] != n_seqs || c->ne[2] != n_written || c->ne[3] != 1 ||
             (c->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-            return nullptr;
+            GDN_REJECT("destination not a contiguous device F32 cache view of the expected shape");
         }
         // the input state must not alias the destination (a direct-from-cache state getter would race in place)
         if (gdn->src[5] && gdn->src[5]->buffer && ggml_vk_tensors_overlap(gdn->src[5], c, false)) {
-            return nullptr;
+            GDN_REJECT("input state aliases the destination");
         }
         // nothing else may read the GDN output's state region: with the fusion it is no longer written. Checked
         // completely with the graph's use counts, not by scanning a window: the state view is read by this CPY alone,
@@ -12450,41 +12453,73 @@ static const ggml_tensor * ggml_vk_find_gdn_state_cpy(ggml_backend_vk_context * 
         // the state region. Unknown use counts or an unaccounted user: no fusion.
         if ((gdn->flags & GGML_TENSOR_FLAG_OUTPUT) || (s->flags & GGML_TENSOR_FLAG_OUTPUT) ||
             ggml_vk_tensor_use_count(cgraph, s) != 1) {
-            return nullptr;
+            GDN_REJECT("GDN output or state view is a graph output, or the state view has other readers");
         }
-        const int32_t gdn_uses = ggml_vk_tensor_use_count(cgraph, gdn);
-        int32_t seen = 0;
-        for (int k = i + 1; k < cgraph->n_nodes && seen < gdn_uses; ++k) {
+        // Every alias of the GDN output's storage is followed, not just its direct readers: a view of a view keeps
+        // the GDN output as its view_src root while its src[0] is the parent view (review R11, round 2). Starting from
+        // the GDN output, each reader of a known alias is either a view of the same storage (a new alias: it must be
+        // the state view or lie entirely below the state region, and its own readers are followed in turn) or a
+        // computing node (it must not read the whole output, and only the CPY may read the state view). The use
+        // counts say how many readers remain, so the scan stops as soon as all are found.
+        const ggml_tensor * aliases[64];
+        int n_aliases = 0;
+        aliases[n_aliases++] = gdn;
+        int64_t pending = ggml_vk_tensor_use_count(cgraph, gdn);
+        if (pending <= 0) {
+            GDN_REJECT("use counts unknown");
+        }
+        for (int k = i + 1; k < cgraph->n_nodes && pending > 0; ++k) {
             const ggml_tensor * n = cgraph->nodes[k];
             for (int q = 0; q < GGML_MAX_SRC; ++q) {
-                if (n->src[q] != gdn) {
+                const ggml_tensor * t = n->src[q];
+                if (t == nullptr || std::find(aliases, aliases + n_aliases, t) == aliases + n_aliases) {
                     continue;
                 }
-                ++seen;
-                if (n != s && (n->view_src != gdn || n->view_offs + ggml_nbytes(n) > s_off_bytes)) {
-                    return nullptr;
+                --pending;
+                if (n->view_src == gdn) {  // a view of the storage
+                    if (n != s && n->view_offs + ggml_nbytes(n) > s_off_bytes) {
+                        GDN_REJECT("a view of the GDN output reaches the state region");
+                    }
+                    if (std::find(aliases, aliases + n_aliases, n) != aliases + n_aliases) {
+                        continue;  // (a second source slot of the same view)
+                    }
+                    const int32_t uses = ggml_vk_tensor_use_count(cgraph, n);
+                    if (uses < 0 || n_aliases == 64) {
+                        GDN_REJECT("use counts unknown, or too many views of the GDN output");
+                    }
+                    aliases[n_aliases++] = n;
+                    pending += uses;
+                } else if (t == gdn) {
+                    GDN_REJECT("a node reads the whole GDN output");
+                } else if (t == s && n != c) {
+                    GDN_REJECT("the state view has another reader");
                 }
             }
         }
-        if (gdn_uses <= 0 || seen != gdn_uses) {
-            return nullptr;
+        if (pending != 0) {
+            GDN_REJECT("readers of the GDN output unaccounted for");
         }
-        // nothing between the GDN and the CPY may touch the destination
+        // nothing between the GDN and the CPY may touch the destination (views, reshapes and permutes touch no memory:
+        // whoever reads them is a later node whose sources are checked here)
         for (int k = i + 1; k < j; ++k) {
             const ggml_tensor * n = cgraph->nodes[k];
+            if (ggml_op_is_empty(n->op)) {
+                continue;
+            }
             if (n->buffer && ggml_vk_tensors_overlap(n, c, false)) {
-                return nullptr;
+                GDN_REJECT("a node between the GDN and the CPY touches the destination");
             }
             for (int q = 0; q < GGML_MAX_SRC; ++q) {
                 if (n->src[q] && n->src[q]->buffer && ggml_vk_tensors_overlap(n->src[q], c, false)) {
-                    return nullptr;
+                    GDN_REJECT("a node between the GDN and the CPY reads the destination");
                 }
             }
         }
         return c;
     }
-    return nullptr;
+    GDN_REJECT("no state CPY within 16 nodes");
 }
+#undef GDN_REJECT
 
 bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit){
     ggml_tensor * node = cgraph->nodes[node_idx];
@@ -14917,6 +14952,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
         ctx->gdn_fused_cpy = cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET ? ggml_vk_find_gdn_state_cpy(ctx, cgraph, i, last_node) : nullptr;
+        {
+            static const bool log_gdn = getenv("GGML_VK_LOG_GDN_CPY_FUSION") != nullptr;
+            if (log_gdn && cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET) {
+                fprintf(stderr, "ggml_vulkan: GDN state-CPY fusion %s\n", ctx->gdn_fused_cpy ? "applied" : "not applied");
+            }
+        }
 
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
 

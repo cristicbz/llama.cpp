@@ -5189,17 +5189,23 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     const int64_t n_seq_tokens;
     const int64_t n_seqs;
     const int64_t K; // snapshot slot count (>1)
+    // 0: fusable; the others must not fuse (the state region the fused GDN no longer writes is read elsewhere):
+    // 1: a second reader of the state view; 2: a view of the attention view reaching into the state region (a nested
+    // alias: its view_src is the GDN output, its src[0] the attention view); 3: the GDN output is a graph output
+    const int variant;
 
     ggml_tensor * cpy_node = nullptr;
+    std::vector<ggml_tensor *> verify;
 
     std::string vars() override {
-        return VARS_TO_STR6(type, head_count, head_size, n_seq_tokens, n_seqs, K);
+        return VARS_TO_STR7(type, head_count, head_size, n_seq_tokens, n_seqs, K, variant);
     }
 
     test_gated_delta_net_cache_fusion(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 2, int64_t n_seqs = 1,
-            int64_t K = 2)
-        : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K) {}
+            int64_t K = 2, int variant = 0)
+        : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K),
+          variant(variant) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t S_v = head_size;
@@ -5258,6 +5264,20 @@ struct test_gated_delta_net_cache_fusion : public test_case {
         // read the cpy output (not the plain dst view, which would not pull the cpy into the graph)
         // so that neither the gdn nor the cpy is the graph output
         ggml_tensor * out = ggml_sum(ctx, cpy);
+        verify = { cpy_node };
+        if (variant == 1) {  // the state view read again, after the CPY
+            out = ggml_add(ctx, out, ggml_sum(ctx, src));
+        } else if (variant == 2) {  // a view of the attention view, offset into the state region
+            ggml_tensor * nested = ggml_view_1d(ctx, attn, D, ggml_row_size(gdn_out->type, attn_score_elems));
+            ggml_set_name(nested, "nested_state_alias");
+            out = ggml_add(ctx, out, ggml_sum(ctx, nested));
+        } else if (variant == 3) {
+            ggml_set_output(gdn_out);
+            verify.push_back(gdn_out);
+        }
+        if (variant == 1 || variant == 2) {
+            verify.push_back(out);
+        }
         return out;
     }
 
@@ -5267,7 +5287,7 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 
     bool run_whole_graph() override { return true; }
-    std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node }; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return verify; }
 
     uint64_t op_flops(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -12725,6 +12745,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+    for (int variant : {1, 2, 3}) {  // must not fuse (majel fork, review R11)
+        test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32, 2, 1, 2, variant));
+        test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32, 4, 2, 4, variant));
+    }
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
