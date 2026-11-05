@@ -12399,6 +12399,18 @@ void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subct
     }
 }
 
+// how many graph nodes read tensor t (any tensor the graph visited; -1 if unknown)
+static int32_t ggml_vk_tensor_use_count(const ggml_cgraph * cgraph, const ggml_tensor * t) {
+    if (cgraph->use_counts == nullptr) {
+        return -1;
+    }
+    const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+    if (pos == GGML_HASHSET_FULL || !ggml_bitset_get(cgraph->visited_hash_set.used, pos)) {
+        return -1;
+    }
+    return cgraph->use_counts[pos];
+}
+
 // GATED_DELTA_NET followed (within a few nodes) by the CPY of its state snapshot(s) into the recurrent cache:
 // returns that CPY if the GDN shader can write the snapshots there directly.
 static const ggml_tensor * ggml_vk_find_gdn_state_cpy(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int i, int last_node) {
@@ -12432,22 +12444,30 @@ static const ggml_tensor * ggml_vk_find_gdn_state_cpy(ggml_backend_vk_context * 
         if (gdn->src[5] && gdn->src[5]->buffer && ggml_vk_tensors_overlap(gdn->src[5], c, false)) {
             return nullptr;
         }
-        // nothing else may read the GDN output's state region: with the fusion it is no longer written
-        for (int k = i + 1; k < std::min(cgraph->n_nodes, i + 64); ++k) {
+        // nothing else may read the GDN output's state region: with the fusion it is no longer written. Checked
+        // completely with the graph's use counts, not by scanning a window: the state view is read by this CPY alone,
+        // and every user of the GDN output is accounted for, each either that state view or a view entirely below
+        // the state region. Unknown use counts or an unaccounted user: no fusion.
+        if ((gdn->flags & GGML_TENSOR_FLAG_OUTPUT) || (s->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            ggml_vk_tensor_use_count(cgraph, s) != 1) {
+            return nullptr;
+        }
+        const int32_t gdn_uses = ggml_vk_tensor_use_count(cgraph, gdn);
+        int32_t seen = 0;
+        for (int k = i + 1; k < cgraph->n_nodes && seen < gdn_uses; ++k) {
             const ggml_tensor * n = cgraph->nodes[k];
-            if (n == c || ggml_op_is_empty(n->op)) {
-                continue;
-            }
             for (int q = 0; q < GGML_MAX_SRC; ++q) {
-                const ggml_tensor * t = n->src[q];
-                if (!t || (t != gdn && t->view_src != gdn) || t == s) {
+                if (n->src[q] != gdn) {
                     continue;
                 }
-                const size_t t_off = t == gdn ? 0 : t->view_offs;
-                if (t_off + ggml_nbytes(t) > s_off_bytes) {
+                ++seen;
+                if (n != s && (n->view_src != gdn || n->view_offs + ggml_nbytes(n) > s_off_bytes)) {
                     return nullptr;
                 }
             }
+        }
+        if (gdn_uses <= 0 || seen != gdn_uses) {
+            return nullptr;
         }
         // nothing between the GDN and the CPY may touch the destination
         for (int k = i + 1; k < j; ++k) {
