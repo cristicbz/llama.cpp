@@ -192,11 +192,6 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("post_sampling_probs", params.post_sampling_probs))
         ->set_desc("Return probabilities of top n_probs tokens after applying the sampling chain"));
 
-    add((new field_num("n_probs_tokens", params.n_probs_tokens))
-        ->set_hard_limits(0, INT32_MAX)
-        ->set_desc("If greater than 0, only the first N generated tokens get probabilities (n_probs / top_logprobs): "
-                   "computing them costs ~8% of decode speed, and a router needs only the first token"));
-
     //
     // Speculative decoding params
     //

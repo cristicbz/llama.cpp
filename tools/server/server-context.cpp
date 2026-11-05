@@ -4898,8 +4898,7 @@ private:
             result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
             result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
 
-            if (slot.task->params.sampling.n_probs > 0 &&
-                (slot.task->params.n_probs_tokens <= 0 || slot.stats.n_gen <= slot.task->params.n_probs_tokens)) {
+            if (slot.task->params.sampling.n_probs > 0) {
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
             }
 
@@ -5042,8 +5041,7 @@ private:
                 result.prob         = 1.0f; // set later
 
                 // post_sampling_probs is not supported with speculative decoding
-                if (slot.task->params.sampling.n_probs > 0 && !slot.task->params.post_sampling_probs &&
-                    (slot.task->params.n_probs_tokens <= 0 || slot.stats.n_gen < slot.task->params.n_probs_tokens)) {
+                if (slot.task->params.sampling.n_probs > 0 && !slot.task->params.post_sampling_probs) {
                     populate_token_probs(slot, result, false, params_base.special, spec_i_batch[i]);
                 }
 
