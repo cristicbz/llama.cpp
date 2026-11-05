@@ -705,6 +705,10 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+    uint32_t sdst_off;   // fused state CPY: element offset of the destination view in binding 7
+    uint32_t sdst_seq;   // element stride between sequences in the destination
+    uint32_t sdst_slot;  // element stride between snapshot slots in the destination
+    uint32_t use_sdst;
 };
 
 struct vk_op_ssm_scan_push_constants {

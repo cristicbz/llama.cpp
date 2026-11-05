@@ -1279,6 +1279,9 @@ struct ggml_backend_vk_context {
     // number of additional consecutive nodes that are being fused with the
     // node currently being processed
     int num_additional_fused_ops {};
+    // GATED_DELTA_NET + state CPY fusion: the CPY fused into the GDN being built, and CPYs to skip in this graph
+    const ggml_tensor * gdn_fused_cpy {};
+    std::vector<const ggml_tensor *> gdn_skip_nodes;
     // Bitmask of which fused ops need to write an intermediate value to memory.
     // Bit 'i' means nodes[start_of_fusion + i] writes to memory.
     // If there's no fusion, bit 0 is still set.
